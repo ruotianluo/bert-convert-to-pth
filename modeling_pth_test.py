@@ -21,9 +21,10 @@ import json
 import random
 import re
 
-import modeling
+import modeling_pth as modeling
 import six
 import tensorflow as tf
+import torch
 
 
 class BertModelTest(tf.test.TestCase):
@@ -96,12 +97,10 @@ class BertModelTest(tf.test.TestCase):
           initializer_range=self.initializer_range)
 
       model = modeling.BertModel(
-          config=config,
-          is_training=self.is_training,
-          input_ids=input_ids,
+          config=config)
+      model(input_ids=input_ids,
           input_mask=input_mask,
-          token_type_ids=token_type_ids,
-          scope=self.scope)
+          token_type_ids=token_type_ids)
 
       outputs = {
           "embedding_output": model.get_embedding_output(),
@@ -134,14 +133,15 @@ class BertModelTest(tf.test.TestCase):
 
   def run_tester(self, tester):
     with self.test_session() as sess:
-      ops = tester.create_model()
-      init_op = tf.group(tf.global_variables_initializer(),
-                         tf.local_variables_initializer())
-      sess.run(init_op)
-      output_result = sess.run(ops)
+    #   ops = tester.create_model()
+    #   init_op = tf.group(tf.global_variables_initializer(),
+    #                      tf.local_variables_initializer())
+    #   sess.run(init_op)
+    #   output_result = sess.run(ops)
+      output_result = tester.create_model()
       tester.check_output(output_result)
 
-      self.assert_all_tensors_reachable(sess, [init_op, ops])
+    #   self.assert_all_tensors_reachable(sess, [init_op, ops])
 
   @classmethod
   def ids_tensor(cls, shape, vocab_size, rng=None, name=None):
@@ -157,7 +157,8 @@ class BertModelTest(tf.test.TestCase):
     for _ in range(total_dims):
       values.append(rng.randint(0, vocab_size - 1))
 
-    return tf.constant(value=values, dtype=tf.int32, shape=shape, name=name)
+    # return tf.constant(value=values, dtype=tf.int32, shape=shape, name=name)
+    return torch.Tensor(values).long().view(*shape)
 
   def assert_all_tensors_reachable(self, sess, outputs):
     """Checks that all the tensors in the graph are reachable from outputs."""

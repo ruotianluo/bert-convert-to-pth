@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The main BERT model and related functions."""
+"""Common utility functions related to TensorFlow."""
 
 from __future__ import absolute_import
 from __future__ import division
@@ -25,6 +25,10 @@ import math
 import re
 import six
 import tensorflow as tf
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 class BertConfig(object):
@@ -103,7 +107,7 @@ class BertConfig(object):
     return json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n"
 
 
-class BertModel(object):
+class BertModel(nn.Module):
   """BERT model ("Bidirectional Embedding Representations from a Transformer").
 
   Example usage:
@@ -127,20 +131,11 @@ class BertModel(object):
   ```
   """
 
-  def __init__(self,
-               config,
-               is_training,
-               input_ids,
-               input_mask=None,
-               token_type_ids=None,
-               use_one_hot_embeddings=True,
-               scope=None):
+  def __init__(self, config):
     """Constructor for BertModel.
 
     Args:
       config: `BertConfig` instance.
-      is_training: bool. rue for training model, false for eval model. Controls
-        whether dropout will be applied.
       input_ids: int32 Tensor of shape [batch_size, seq_length].
       input_mask: (optional) int32 Tensor of shape [batch_size, seq_length].
       token_type_ids: (optional) int32 Tensor of shape [batch_size, seq_length].
@@ -154,38 +149,16 @@ class BertModel(object):
       ValueError: The config is invalid or one of the input tensor shapes
         is invalid.
     """
-    config = copy.deepcopy(config)
-    if not is_training:
-      config.hidden_dropout_prob = 0.0
-      config.attention_probs_dropout_prob = 0.0
-
-    input_shape = get_shape_list(input_ids, expected_rank=2)
-    batch_size = input_shape[0]
-    seq_length = input_shape[1]
-
-    if input_mask is None:
-      input_mask = tf.ones(shape=[batch_size, seq_length], dtype=tf.int32)
-
-    if token_type_ids is None:
-      token_type_ids = tf.zeros(shape=[batch_size, seq_length], dtype=tf.int32)
-
-    with tf.variable_scope("bert", scope):
-      with tf.variable_scope("embeddings"):
-        # Perform embedding lookup on the word ids.
-        (self.embedding_output, self.embedding_table) = embedding_lookup(
-            input_ids=input_ids,
+    super(BertModel, self).__init__()
+    self.config = copy.deepcopy(config)
+    self.bert = nn.ModuleDict()
+    self.bert['embeddings'] = embedding_lookup(
             vocab_size=config.vocab_size,
             embedding_size=config.hidden_size,
-            initializer_range=config.initializer_range,
-            word_embedding_name="word_embeddings",
-            use_one_hot_embeddings=use_one_hot_embeddings)
-
-        # Add positional embeddings and token type embeddings, then layer
-        # normalize and perform dropout.
-        self.embedding_output = embedding_postprocessor(
-            input_tensor=self.embedding_output,
+            initializer_range=config.initializer_range)
+    self.bert['embedding_postprocessor'] = embedding_postprocessor(
+            embedding_size=config.hidden_size,
             use_token_type=True,
-            token_type_ids=token_type_ids,
             token_type_vocab_size=config.type_vocab_size,
             token_type_embedding_name="token_type_embeddings",
             use_position_embeddings=True,
@@ -193,19 +166,7 @@ class BertModel(object):
             initializer_range=config.initializer_range,
             max_position_embeddings=config.max_position_embeddings,
             dropout_prob=config.hidden_dropout_prob)
-
-      with tf.variable_scope("encoder"):
-        # This converts a 2D mask of shape [batch_size, seq_length] to a 3D
-        # mask of shape [batch_size, seq_length, seq_length] which is used
-        # for the attention scores.
-        attention_mask = create_attention_mask_from_input_mask(
-            input_ids, input_mask)
-
-        # Run the stacked transformer.
-        # `sequence_output` shape = [batch_size, seq_length, hidden_size].
-        self.all_encoder_layers = transformer_model(
-            input_tensor=self.embedding_output,
-            attention_mask=attention_mask,
+    self.bert['encoder'] = transformer_model(
             hidden_size=config.hidden_size,
             num_hidden_layers=config.num_hidden_layers,
             num_attention_heads=config.num_attention_heads,
@@ -215,22 +176,76 @@ class BertModel(object):
             attention_probs_dropout_prob=config.attention_probs_dropout_prob,
             initializer_range=config.initializer_range,
             do_return_all_layers=True)
+    self.bert['pooler'] = nn.Linear(config.hidden_size, config.hidden_size)
+    truncated_normal_(self.bert['pooler'].weight, std=config.initializer_range)
 
-      self.sequence_output = self.all_encoder_layers[-1]
-      # The "pooler" converts the encoded sequence tensor of shape
-      # [batch_size, seq_length, hidden_size] to a tensor of shape
-      # [batch_size, hidden_size]. This is necessary for segment-level
-      # (or segment-pair-level) classification tasks where we need a fixed
-      # dimensional representation of the segment.
-      with tf.variable_scope("pooler"):
-        # We "pool" the model by simply taking the hidden state corresponding
-        # to the first token. We assume that this has been pre-trained
-        first_token_tensor = tf.squeeze(self.sequence_output[:, 0:1, :], axis=1)
-        self.pooled_output = tf.layers.dense(
-            first_token_tensor,
-            config.hidden_size,
-            activation=tf.tanh,
-            kernel_initializer=create_initializer(config.initializer_range))
+  def forward(self,
+              input_ids,
+              input_mask=None,
+              token_type_ids=None,
+              use_one_hot_embeddings=False):
+    """Forward for BertModel.
+
+    Args:
+      input_ids: int32 Tensor of shape [batch_size, seq_length].
+      input_mask: (optional) int32 Tensor of shape [batch_size, seq_length].
+      token_type_ids: (optional) int32 Tensor of shape [batch_size, seq_length].
+      use_one_hot_embeddings: (optional) bool. Whether to use one-hot word
+        embeddings or tf.embedding_lookup() for the word embeddings. On the TPU,
+        it is must faster if this is True, on the CPU or GPU, it is faster if
+        this is False.
+
+    Raises:
+      ValueError: The config is invalid or one of the input tensor shapes
+        is invalid.
+    """
+    input_shape = get_shape_list(input_ids, expected_rank=2)
+    batch_size = input_shape[0]
+    seq_length = input_shape[1]
+
+    if input_mask is None:
+      input_mask = input_ids.new_ones((batch_size, seq_length)).long()
+
+    if token_type_ids is None:
+      token_type_ids = input_ids.new_zeros((batch_size, seq_length)).long()
+
+    ##### EMBEDDING
+
+    # Perform embedding lookup on the word ids.
+    self.embedding_output = self.bert['embeddings'](input_ids=input_ids)
+
+    # Add positional embeddings and token type embeddings, then layer
+    # normalize and perform dropout.
+    self.embedding_output = self.bert['embedding_postprocessor'](
+        input_tensor=self.embedding_output,
+        token_type_ids=token_type_ids)
+
+    ####### ENCODER
+    # This converts a 2D mask of shape [batch_size, seq_length] to a 3D
+    # mask of shape [batch_size, seq_length, seq_length] which is used
+    # for the attention scores.
+    attention_mask = create_attention_mask_from_input_mask(
+        input_ids, input_mask)
+
+    # Run the stacked transformer.
+    # `sequence_output` shape = [batch_size, seq_length, hidden_size].
+    self.all_encoder_layers = self.bert['encoder'](
+        input_tensor=self.embedding_output,
+        attention_mask=attention_mask)
+
+    self.sequence_output = self.all_encoder_layers[-1]
+
+    ####### POOLER
+    # The "pooler" converts the encoded sequence tensor of shape
+    # [batch_size, seq_length, hidden_size] to a tensor of shape
+    # [batch_size, hidden_size]. This is necessary for segment-level
+    # (or segment-pair-level) classification tasks where we need a fixed
+    # dimensional representation of the segment.
+      
+    # We "pool" the model by simply taking the hidden state corresponding
+    # to the first token. We assume that this has been pre-trained
+    first_token_tensor = torch.squeeze(self.sequence_output[:, 0:1, :], 1)
+    self.pooled_output = torch.tanh(self.bert['pooler'](first_token_tensor))
 
   def get_pooled_output(self):
     return self.pooled_output
@@ -259,7 +274,7 @@ class BertModel(object):
     return self.embedding_output
 
   def get_embedding_table(self):
-    return self.embedding_table
+    return self.bert['embeddings'].word_embeddings.weight
 
 
 def gelu(input_tensor):
@@ -274,7 +289,7 @@ def gelu(input_tensor):
   Returns:
     `input_tensor` with the GELU activation applied.
   """
-  cdf = 0.5 * (1.0 + tf.erf(input_tensor / tf.sqrt(2.0)))
+  cdf = 0.5 * (1.0 + torch.erf(input_tensor / (2.0 ** 0.5)))
   return input_tensor * cdf
 
 
@@ -306,11 +321,11 @@ def get_activation(activation_string):
   if act == "linear":
     return None
   elif act == "relu":
-    return tf.nn.relu
+    return lambda x: F.relu(x, True)
   elif act == "gelu":
     return gelu
   elif act == "tanh":
-    return tf.tanh
+    return torch.tanh
   else:
     raise ValueError("Unsupported activation: %s" % act)
 
@@ -342,192 +357,211 @@ def get_assigment_map_from_checkpoint(tvars, init_checkpoint):
   return (assignment_map, initialized_variable_names)
 
 
-def dropout(input_tensor, dropout_prob):
-  """Perform dropout.
-
-  Args:
-    input_tensor: float Tensor.
-    dropout_prob: Python float. The probability of dropping out a value (NOT of
-      *keeping* a dimension as in `tf.nn.dropout`).
-
-  Returns:
-    A version of `input_tensor` with dropout applied.
-  """
-  if dropout_prob is None or dropout_prob == 0.0:
-    return input_tensor
-
-  output = tf.nn.dropout(input_tensor, 1.0 - dropout_prob)
-  return output
-
-
-def layer_norm(input_tensor, name=None):
-  """Run layer normalization on the last dimension of the tensor."""
-  return tf.contrib.layers.layer_norm(
-      inputs=input_tensor, begin_norm_axis=-1, begin_params_axis=-1, scope=name)
-
-
-def layer_norm_and_dropout(input_tensor, dropout_prob, name=None):
-  """Runs layer normalization followed by dropout."""
-  output_tensor = layer_norm(input_tensor, name)
-  output_tensor = dropout(output_tensor, dropout_prob)
-  return output_tensor
-
-
 def create_initializer(initializer_range=0.02):
   """Creates a `truncated_normal_initializer` with the given range."""
   return tf.truncated_normal_initializer(stddev=initializer_range)
 
+def truncated_normal_(tensor, mean=0, std=1):
+    size = tensor.shape
+    tmp = tensor.new_empty(size + (4,)).normal_()
+    valid = (tmp < 2) & (tmp > -2)
+    ind = valid.max(-1, keepdim=True)[1]
+    tensor.data.copy_(tmp.gather(-1, ind).squeeze(-1))
+    tensor.data.mul_(std).add_(mean)
 
-def embedding_lookup(input_ids,
-                     vocab_size,
-                     embedding_size=128,
-                     initializer_range=0.02,
-                     word_embedding_name="word_embeddings",
-                     use_one_hot_embeddings=False):
-  """Looks up words embeddings for id tensor.
+class embedding_lookup(nn.Module):
 
-  Args:
-    input_ids: int32 Tensor of shape [batch_size, seq_length] containing word
-      ids.
-    vocab_size: int. Size of the embedding vocabulary.
-    embedding_size: int. Width of the word embeddings.
-    initializer_range: float. Embedding initialization range.
-    word_embedding_name: string. Name of the embedding table.
-    use_one_hot_embeddings: bool. If True, use one-hot method for word
-      embeddings. If False, use `tf.nn.embedding_lookup()`. One hot is better
-      for TPUs.
+  def __init__(self, 
+               vocab_size,
+               embedding_size=128,
+               initializer_range=0.02):
+    """Looks up words embeddings for id tensor.
 
-  Returns:
-    float Tensor of shape [batch_size, seq_length, embedding_size].
-  """
-  # This function assumes that the input is of shape [batch_size, seq_length,
-  # num_inputs].
-  #
-  # If the input is a 2D tensor of shape [batch_size, seq_length], we
-  # reshape to [batch_size, seq_length, 1].
-  if input_ids.shape.ndims == 2:
-    input_ids = tf.expand_dims(input_ids, axis=[-1])
+    Args:
+      vocab_size: int. Size of the embedding vocabulary.
+      embedding_size: int. Width of the word embeddings.
+      initializer_range: float. Embedding initialization range.
+      word_embedding_name: string. Name of the embedding table.
+      use_one_hot_embeddings: bool. If True, use one-hot method for word
+        embeddings. If False, use `tf.nn.embedding_lookup()`. One hot is better
+        for TPUs.
+    """
+    super(embedding_lookup, self).__init__()
+    self.word_embeddings = nn.Embedding(vocab_size, embedding_size)
+    truncated_normal_(self.word_embeddings.weight, std=initializer_range)
 
-  embedding_table = tf.get_variable(
-      name=word_embedding_name,
-      shape=[vocab_size, embedding_size],
-      initializer=create_initializer(initializer_range))
+  def forward(self, input_ids, use_one_hot_embeddings=False):
+    """Looks up words embeddings for id tensor.
 
-  if use_one_hot_embeddings:
-    flat_input_ids = tf.reshape(input_ids, [-1])
-    one_hot_input_ids = tf.one_hot(flat_input_ids, depth=vocab_size)
-    output = tf.matmul(one_hot_input_ids, embedding_table)
-  else:
-    output = tf.nn.embedding_lookup(embedding_table, input_ids)
+    Args:
+      input_ids: int32 Tensor of shape [batch_size, seq_length] containing word
+        ids.
+      use_one_hot_embeddings: bool. If True, use one-hot method for word
+        embeddings. If False, use `tf.nn.embedding_lookup()`. One hot is better
+        for TPUs.
 
-  input_shape = get_shape_list(input_ids)
-
-  output = tf.reshape(output,
-                      input_shape[0:-1] + [input_shape[-1] * embedding_size])
-  return (output, embedding_table)
-
-
-def embedding_postprocessor(input_tensor,
-                            use_token_type=False,
-                            token_type_ids=None,
-                            token_type_vocab_size=16,
-                            token_type_embedding_name="token_type_embeddings",
-                            use_position_embeddings=True,
-                            position_embedding_name="position_embeddings",
-                            initializer_range=0.02,
-                            max_position_embeddings=512,
-                            dropout_prob=0.1):
-  """Performs various post-processing on a word embedding tensor.
-
-  Args:
-    input_tensor: float Tensor of shape [batch_size, seq_length,
-      embedding_size].
-    use_token_type: bool. Whether to add embeddings for `token_type_ids`.
-    token_type_ids: (optional) int32 Tensor of shape [batch_size, seq_length].
-      Must be specified if `use_token_type` is True.
-    token_type_vocab_size: int. The vocabulary size of `token_type_ids`.
-    token_type_embedding_name: string. The name of the embedding table variable
-      for token type ids.
-    use_position_embeddings: bool. Whether to add position embeddings for the
-      position of each token in the sequence.
-    position_embedding_name: string. The name of the embedding table variable
-      for positional embeddings.
-    initializer_range: float. Range of the weight initialization.
-    max_position_embeddings: int. Maximum sequence length that might ever be
-      used with this model. This can be longer than the sequence length of
-      input_tensor, but cannot be shorter.
-    dropout_prob: float. Dropout probability applied to the final output tensor.
-
-  Returns:
-    float tensor with same shape as `input_tensor`.
-
-  Raises:
-    ValueError: One of the tensor shapes or input values is invalid.
-  """
-  input_shape = get_shape_list(input_tensor, expected_rank=3)
-  batch_size = input_shape[0]
-  seq_length = input_shape[1]
-  width = input_shape[2]
-
-  if seq_length > max_position_embeddings:
-    raise ValueError("The seq length (%d) cannot be greater than "
-                     "`max_position_embeddings` (%d)" %
-                     (seq_length, max_position_embeddings))
-
-  output = input_tensor
-
-  if use_token_type:
-    if token_type_ids is None:
-      raise ValueError("`token_type_ids` must be specified if"
-                       "`use_token_type` is True.")
-    token_type_table = tf.get_variable(
-        name=token_type_embedding_name,
-        shape=[token_type_vocab_size, width],
-        initializer=create_initializer(initializer_range))
-    # This vocab will be small so we always do one-hot here, since it is always
-    # faster for a small vocabulary.
-    flat_token_type_ids = tf.reshape(token_type_ids, [-1])
-    one_hot_ids = tf.one_hot(flat_token_type_ids, depth=token_type_vocab_size)
-    token_type_embeddings = tf.matmul(one_hot_ids, token_type_table)
-    token_type_embeddings = tf.reshape(token_type_embeddings,
-                                       [batch_size, seq_length, width])
-    output += token_type_embeddings
-
-  if use_position_embeddings:
-    full_position_embeddings = tf.get_variable(
-        name=position_embedding_name,
-        shape=[max_position_embeddings, width],
-        initializer=create_initializer(initializer_range))
-    # Since the position embedding table is a learned variable, we create it
-    # using a (long) sequence length `max_position_embeddings`. The actual
-    # sequence length might be shorter than this, for faster training of
-    # tasks that do not have long sequences.
+    Returns:
+      float Tensor of shape [batch_size, seq_length, embedding_size].
+    """
+    # This function assumes that the input is of shape [batch_size, seq_length,
+    # num_inputs].
     #
-    # So `full_position_embeddings` is effectively an embedding table
-    # for position [0, 1, 2, ..., max_position_embeddings-1], and the current
-    # sequence has positions [0, 1, 2, ... seq_length-1], so we can just
-    # perform a slice.
-    if seq_length < max_position_embeddings:
-      position_embeddings = tf.slice(full_position_embeddings, [0, 0],
-                                     [seq_length, -1])
+    # If the input is a 2D tensor of shape [batch_size, seq_length], we
+    # reshape to [batch_size, seq_length, 1].
+    if len(input_ids.shape) == 2:
+      input_ids = input_ids.unsqueeze(-1)
+
+    if use_one_hot_embeddings:
+      # flat_input_ids = tf.reshape(input_ids, [-1])
+      # one_hot_input_ids = tf.one_hot(flat_input_ids, depth=vocab_size)
+      # output = tf.matmul(one_hot_input_ids, embedding_table)
+      raise ValueError('One hot embedding not supported')
     else:
-      position_embeddings = full_position_embeddings
+      output = self.word_embeddings(input_ids)
+    
+    input_shape = get_shape_list(input_ids)
 
-    num_dims = len(output.shape.as_list())
+    output = torch.reshape(output, input_shape[:-1]+(-1,))
+    return output
 
-    # Only the last two dimensions are relevant (`seq_length` and `width`), so
-    # we broadcast among the first dimensions, which is typically just
-    # the batch size.
-    position_broadcast_shape = []
-    for _ in range(num_dims - 2):
-      position_broadcast_shape.append(1)
-    position_broadcast_shape.extend([seq_length, width])
-    position_embeddings = tf.reshape(position_embeddings,
-                                     position_broadcast_shape)
-    output += position_embeddings
 
-  output = layer_norm_and_dropout(output, dropout_prob)
-  return output
+class embedding_postprocessor(nn.Module):
+  def __init__(self,
+               embedding_size,
+               use_token_type=False,
+               token_type_vocab_size=16,
+               token_type_embedding_name="token_type_embeddings",
+               use_position_embeddings=True,
+               position_embedding_name="position_embeddings",
+               initializer_range=0.02,
+               max_position_embeddings=512,
+               dropout_prob=0.1):
+    """Performs various post-processing on a word embedding tensor.
+
+    Args:
+      use_token_type: bool. Whether to add embeddings for `token_type_ids`.
+      token_type_vocab_size: int. The vocabulary size of `token_type_ids`.
+      token_type_embedding_name: string. The name of the embedding table variable
+        for token type ids.
+      use_position_embeddings: bool. Whether to add position embeddings for the
+        position of each token in the sequence.
+      position_embedding_name: string. The name of the embedding table variable
+        for positional embeddings.
+      initializer_range: float. Range of the weight initialization.
+      max_position_embeddings: int. Maximum sequence length that might ever be
+        used with this model. This can be longer than the sequence length of
+        input_tensor, but cannot be shorter.
+      dropout_prob: float. Dropout probability applied to the final output tensor.
+
+    Returns:
+      float tensor with same shape as `input_tensor`.
+
+    Raises:
+      ValueError: One of the tensor shapes or input values is invalid.
+    """
+    super(embedding_postprocessor, self).__init__()
+    self.use_token_type = use_token_type
+    print('Need to benchmark one hot embedding vs Embedding')
+    if self.use_token_type:
+      self.token_type_embeddings = nn.Embedding(token_type_vocab_size, embedding_size)
+      truncated_normal_(self.token_type_embeddings.weight, std=initializer_range)
+
+    self.use_position_embeddings = use_position_embeddings
+    if self.use_position_embeddings:
+      self.position_embeddings = nn.Parameter(torch.zeros(max_position_embeddings, embedding_size))
+      truncated_normal_(self.position_embeddings, std=initializer_range)
+      
+    self.layer_norm = nn.LayerNorm(embedding_size)
+    self.dropout = nn.Dropout(dropout_prob)
+
+    self.max_position_embeddings = max_position_embeddings
+
+  def forward(self, 
+              input_tensor,
+              token_type_ids=None):
+    """Performs various post-processing on a word embedding tensor.
+
+    Args:
+      input_tensor: float Tensor of shape [batch_size, seq_length,
+        embedding_size].
+      use_token_type: bool. Whether to add embeddings for `token_type_ids`.
+      token_type_ids: (optional) int32 Tensor of shape [batch_size, seq_length].
+        Must be specified if `use_token_type` is True.
+      token_type_vocab_size: int. The vocabulary size of `token_type_ids`.
+      token_type_embedding_name: string. The name of the embedding table variable
+        for token type ids.
+      use_position_embeddings: bool. Whether to add position embeddings for the
+        position of each token in the sequence.
+      position_embedding_name: string. The name of the embedding table variable
+        for positional embeddings.
+      initializer_range: float. Range of the weight initialization.
+      max_position_embeddings: int. Maximum sequence length that might ever be
+        used with this model. This can be longer than the sequence length of
+        input_tensor, but cannot be shorter.
+      dropout_prob: float. Dropout probability applied to the final output tensor.
+
+    Returns:
+      float tensor with same shape as `input_tensor`.
+
+    Raises:
+      ValueError: One of the tensor shapes or input values is invalid.
+    """
+    input_shape = get_shape_list(input_tensor, expected_rank=3)
+    batch_size = input_shape[0]
+    seq_length = input_shape[1]
+    width = input_shape[2]
+
+    if seq_length > self.max_position_embeddings:
+      raise ValueError("The seq length (%d) cannot be greater than "
+                      "`max_position_embeddings` (%d)" %
+                      (seq_length, self.max_position_embeddings))
+
+    output = input_tensor
+
+    if self.use_token_type:
+      if token_type_ids is None:
+        raise ValueError("`token_type_ids` must be specified if"
+                        "`use_token_type` is True.")
+      # This vocab will be small so we always do one-hot here, since it is always
+      # faster for a small vocabulary.
+      # flat_token_type_ids = tf.reshape(token_type_ids, [-1])
+      # one_hot_ids = tf.one_hot(flat_token_type_ids, depth=token_type_vocab_size)
+      # token_type_embeddings = tf.matmul(one_hot_ids, token_type_table)
+      # token_type_embeddings = tf.reshape(token_type_embeddings,
+      #                                    [batch_size, seq_length, width])
+      token_type_embeddings = self.token_type_embeddings(token_type_ids)
+      output += token_type_embeddings
+
+    if self.use_position_embeddings:
+      # Since the position embedding table is a learned variable, we create it
+      # using a (long) sequence length `max_position_embeddings`. The actual
+      # sequence length might be shorter than this, for faster training of
+      # tasks that do not have long sequences.
+      #
+      # So `full_position_embeddings` is effectively an embedding table
+      # for position [0, 1, 2, ..., max_position_embeddings-1], and the current
+      # sequence has positions [0, 1, 2, ... seq_length-1], so we can just
+      # perform a slice.
+      if seq_length < self.max_position_embeddings:
+        position_embeddings = self.position_embeddings[:seq_length]
+      else:
+        position_embeddings = self.position_embeddings
+
+      num_dims = len(output.shape)
+
+      # Only the last two dimensions are relevant (`seq_length` and `width`), so
+      # we broadcast among the first dimensions, which is typically just
+      # the batch size.
+      position_broadcast_shape = []
+      for _ in range(num_dims - 2):
+        position_broadcast_shape.append(1)
+      position_broadcast_shape.extend([seq_length, width])
+      position_embeddings = torch.reshape(position_embeddings,
+                                          position_broadcast_shape)
+      output += position_embeddings
+
+    output = self.dropout(self.layer_norm(output))
+    return output
 
 
 def create_attention_mask_from_input_mask(from_tensor, to_mask):
@@ -547,16 +581,14 @@ def create_attention_mask_from_input_mask(from_tensor, to_mask):
   to_shape = get_shape_list(to_mask, expected_rank=2)
   to_seq_length = to_shape[1]
 
-  to_mask = tf.cast(
-      tf.reshape(to_mask, [batch_size, 1, to_seq_length]), tf.float32)
+  to_mask = torch.reshape(to_mask, [batch_size, 1, to_seq_length]).float()
 
   # We don't assume that `from_tensor` is a mask (although it could be). We
   # don't actually care if we attend *from* padding tokens (only *to* padding)
   # tokens so we create a tensor of all ones.
   #
   # `broadcast_ones` = [batch_size, from_seq_length, 1]
-  broadcast_ones = tf.ones(
-      shape=[batch_size, from_seq_length, 1], dtype=tf.float32)
+  broadcast_ones = to_mask.new_ones((batch_size, from_seq_length, 1))
 
   # Here we broadcast along two dimensions to create the mask.
   mask = broadcast_ones * to_mask
@@ -564,203 +596,212 @@ def create_attention_mask_from_input_mask(from_tensor, to_mask):
   return mask
 
 
-def attention_layer(from_tensor,
-                    to_tensor,
-                    attention_mask=None,
-                    num_attention_heads=1,
-                    size_per_head=512,
-                    query_act=None,
-                    key_act=None,
-                    value_act=None,
-                    attention_probs_dropout_prob=0.0,
-                    initializer_range=0.02,
-                    do_return_2d_tensor=False,
-                    batch_size=None,
-                    from_seq_length=None,
-                    to_seq_length=None):
-  """Performs multi-headed attention from `from_tensor` to `to_tensor`.
+class attention_layer(nn.Module):
+  def __init__(self,
+               input_dim,
+               num_attention_heads=1,
+               size_per_head=512,
+               query_act=None,
+               key_act=None,
+               value_act=None,
+               attention_probs_dropout_prob=0.0,
+               initializer_range=0.02,
+               do_return_2d_tensor=False):
+    """Performs multi-headed attention from `from_tensor` to `to_tensor`.
 
-  This is an implementation of multi-headed attention based on "Attention
-  is all you Need". If `from_tensor` and `to_tensor` are the same, then
-  this is self-attention. Each timestep in `from_tensor` attends to the
-  corresponding sequence in `to_tensor`, and returns a fixed-with vector.
+    This is an implementation of multi-headed attention based on "Attention
+    is all you Need". If `from_tensor` and `to_tensor` are the same, then
+    this is self-attention. Each timestep in `from_tensor` attends to the
+    corresponding sequence in `to_tensor`, and returns a fixed-with vector.
 
-  This function first projects `from_tensor` into a "query" tensor and
-  `to_tensor` into "key" and "value" tensors. These are (effectively) a list
-  of tensors of length `num_attention_heads`, where each tensor is of shape
-  [batch_size, seq_length, size_per_head].
+    This function first projects `from_tensor` into a "query" tensor and
+    `to_tensor` into "key" and "value" tensors. These are (effectively) a list
+    of tensors of length `num_attention_heads`, where each tensor is of shape
+    [batch_size, seq_length, size_per_head].
 
-  Then, the query and key tensors are dot-producted and scaled. These are
-  softmaxed to obtain attention probabilities. The value tensors are then
-  interpolated by these probabilities, then concatenated back to a single
-  tensor and returned.
+    Then, the query and key tensors are dot-producted and scaled. These are
+    softmaxed to obtain attention probabilities. The value tensors are then
+    interpolated by these probabilities, then concatenated back to a single
+    tensor and returned.
 
-  In practice, the multi-headed attention are done with transposes and
-  reshapes rather than actual separate tensors.
+    In practice, the multi-headed attention are done with transposes and
+    reshapes rather than actual separate tensors.
 
-  Args:
-    from_tensor: float Tensor of shape [batch_size, from_seq_length,
-      from_width].
-    to_tensor: float Tensor of shape [batch_size, to_seq_length, to_width].
-    attention_mask: (optional) int32 Tensor of shape [batch_size,
-      from_seq_length, to_seq_length]. The values should be 1 or 0. The
-      attention scores will effectively be set to -infinity for any positions in
-      the mask that are 0, and will be unchanged for positions that are 1.
-    num_attention_heads: int. Number of attention heads.
-    size_per_head: int. Size of each attention head.
-    query_act: (optional) Activation function for the query transform.
-    key_act: (optional) Activation function for the key transform.
-    value_act: (optional) Activation function for the value transform.
-    attention_probs_dropout_prob:
-    initializer_range: float. Range of the weight initializer.
-    do_return_2d_tensor: bool. If True, the output will be of shape [batch_size
-      * from_seq_length, num_attention_heads * size_per_head]. If False, the
-      output will be of shape [batch_size, from_seq_length, num_attention_heads
-      * size_per_head].
-    batch_size: (Optional) int. If the input is 2D, this might be the batch size
-      of the 3D version of the `from_tensor` and `to_tensor`.
-    from_seq_length: (Optional) If the input is 2D, this might be the seq length
-      of the 3D version of the `from_tensor`.
-    to_seq_length: (Optional) If the input is 2D, this might be the seq length
-      of the 3D version of the `to_tensor`.
+    Args:
+      from_tensor: float Tensor of shape [batch_size, from_seq_length,
+        from_width].
+      to_tensor: float Tensor of shape [batch_size, to_seq_length, to_width].
+      attention_mask: (optional) int32 Tensor of shape [batch_size,
+        from_seq_length, to_seq_length]. The values should be 1 or 0. The
+        attention scores will effectively be set to -infinity for any positions in
+        the mask that are 0, and will be unchanged for positions that are 1.
+      num_attention_heads: int. Number of attention heads.
+      size_per_head: int. Size of each attention head.
+      query_act: (optional) Activation function for the query transform.
+      key_act: (optional) Activation function for the key transform.
+      value_act: (optional) Activation function for the value transform.
+      attention_probs_dropout_prob:
+      initializer_range: float. Range of the weight initializer.
+      do_return_2d_tensor: bool. If True, the output will be of shape [batch_size
+        * from_seq_length, num_attention_heads * size_per_head]. If False, the
+        output will be of shape [batch_size, from_seq_length, num_attention_heads
+        * size_per_head].
+      batch_size: (Optional) int. If the input is 2D, this might be the batch size
+        of the 3D version of the `from_tensor` and `to_tensor`.
+      from_seq_length: (Optional) If the input is 2D, this might be the seq length
+        of the 3D version of the `from_tensor`.
+      to_seq_length: (Optional) If the input is 2D, this might be the seq length
+        of the 3D version of the `to_tensor`.
 
-  Returns:
-    float Tensor of shape [batch_size, from_seq_length,
-      num_attention_heads * size_per_head]. (If `do_return_2d_tensor` is
-      true, this will be of shape [batch_size * from_seq_length,
-      num_attention_heads * size_per_head]).
+    Returns:
+      float Tensor of shape [batch_size, from_seq_length,
+        num_attention_heads * size_per_head]. (If `do_return_2d_tensor` is
+        true, this will be of shape [batch_size * from_seq_length,
+        num_attention_heads * size_per_head]).
 
-  Raises:
-    ValueError: Any of the arguments or tensor shapes are invalid.
-  """
+    Raises:
+      ValueError: Any of the arguments or tensor shapes are invalid.
+    """
+    super(attention_layer, self).__init__()
+    self.num_attention_heads = num_attention_heads
+    self.size_per_head = size_per_head
 
-  def transpose_for_scores(input_tensor, batch_size, num_attention_heads,
-                           seq_length, width):
-    output_tensor = tf.reshape(
-        input_tensor, [batch_size, seq_length, num_attention_heads, width])
+    self.query = nn.Linear(input_dim, num_attention_heads * size_per_head)
+    truncated_normal_(self.query.weight, std=initializer_range)
+    self.query_act = query_act or (lambda x: x)
 
-    output_tensor = tf.transpose(output_tensor, [0, 2, 1, 3])
-    return output_tensor
+    self.key = nn.Linear(input_dim, num_attention_heads * size_per_head)
+    truncated_normal_(self.key.weight, std=initializer_range)
+    self.key_act = key_act or (lambda x: x)
 
-  from_shape = get_shape_list(from_tensor, expected_rank=[2, 3])
-  to_shape = get_shape_list(to_tensor, expected_rank=[2, 3])
+    self.value = nn.Linear(input_dim, num_attention_heads * size_per_head)
+    truncated_normal_(self.value.weight, std=initializer_range)
+    self.value_act = value_act or (lambda x: x)
 
-  if len(from_shape) != len(to_shape):
-    raise ValueError(
-        "The rank of `from_tensor` must match the rank of `to_tensor`.")
+    self.attention_probs_dropout_prob = attention_probs_dropout_prob
+    self.do_return_2d_tensor = do_return_2d_tensor
 
-  if len(from_shape) == 3:
-    batch_size = from_shape[0]
-    from_seq_length = from_shape[1]
-    to_seq_length = to_shape[1]
-  elif len(from_shape) == 2:
-    if (batch_size is None or from_seq_length is None or to_seq_length is None):
+  def forward(self,
+              from_tensor,
+              to_tensor,
+              attention_mask=None,
+              batch_size=None,
+              from_seq_length=None,
+              to_seq_length=None):
+    def transpose_for_scores(input_tensor, batch_size, num_attention_heads,
+                             seq_length, width):
+      output_tensor = torch.reshape(
+          input_tensor, [batch_size, seq_length, num_attention_heads, width])
+
+      output_tensor = output_tensor.permute(0, 2, 1, 3)
+      return output_tensor
+
+    from_shape = get_shape_list(from_tensor, expected_rank=[2, 3])
+    to_shape = get_shape_list(to_tensor, expected_rank=[2, 3])
+
+    if len(from_shape) != len(to_shape):
       raise ValueError(
-          "When passing in rank 2 tensors to attention_layer, the values "
-          "for `batch_size`, `from_seq_length`, and `to_seq_length` "
-          "must all be specified.")
+          "The rank of `from_tensor` must match the rank of `to_tensor`.")
 
-  # Scalar dimensions referenced here:
-  #   B = batch size (number of sequences)
-  #   F = `from_tensor` sequence length
-  #   T = `to_tensor` sequence length
-  #   N = `num_attention_heads`
-  #   H = `size_per_head`
+    if len(from_shape) == 3:
+      batch_size = from_shape[0]
+      from_seq_length = from_shape[1]
+      to_seq_length = to_shape[1]
+    elif len(from_shape) == 2:
+      if (batch_size is None or from_seq_length is None or to_seq_length is None):
+        raise ValueError(
+            "When passing in rank 2 tensors to attention_layer, the values "
+            "for `batch_size`, `from_seq_length`, and `to_seq_length` "
+            "must all be specified.")
 
-  from_tensor_2d = reshape_to_matrix(from_tensor)
-  to_tensor_2d = reshape_to_matrix(to_tensor)
+    # Scalar dimensions referenced here:
+    #   B = batch size (number of sequences)
+    #   F = `from_tensor` sequence length
+    #   T = `to_tensor` sequence length
+    #   N = `num_attention_heads`
+    #   H = `size_per_head`
 
-  # `query_layer` = [B*F, N*H]
-  query_layer = tf.layers.dense(
-      from_tensor_2d,
-      num_attention_heads * size_per_head,
-      activation=query_act,
-      name="query",
-      kernel_initializer=create_initializer(initializer_range))
+    from_tensor_2d = reshape_to_matrix(from_tensor)
+    to_tensor_2d = reshape_to_matrix(to_tensor)
 
-  # `key_layer` = [B*T, N*H]
-  key_layer = tf.layers.dense(
-      to_tensor_2d,
-      num_attention_heads * size_per_head,
-      activation=key_act,
-      name="key",
-      kernel_initializer=create_initializer(initializer_range))
+    # `query_layer` = [B*F, N*H]
+    query_layer = self.query(from_tensor_2d)
+    query_layer = self.query_act(query_layer)
 
-  # `value_layer` = [B*T, N*H]
-  value_layer = tf.layers.dense(
-      to_tensor_2d,
-      num_attention_heads * size_per_head,
-      activation=value_act,
-      name="value",
-      kernel_initializer=create_initializer(initializer_range))
+    # `key_layer` = [B*T, N*H]
+    key_layer = self.key(to_tensor_2d)
+    key_layer = self.key_act(key_layer)
 
-  # `query_layer` = [B, N, F, H]
-  query_layer = transpose_for_scores(query_layer, batch_size,
-                                     num_attention_heads, from_seq_length,
-                                     size_per_head)
+    # `value_layer` = [B*T, N*H]
+    value_layer = self.value(to_tensor_2d)
+    value_layer = self.value_act(value_layer)
 
-  # `key_layer` = [B, N, T, H]
-  key_layer = transpose_for_scores(key_layer, batch_size, num_attention_heads,
-                                   to_seq_length, size_per_head)
+    # `query_layer` = [B, N, F, H]
+    query_layer = transpose_for_scores(query_layer, batch_size,
+                                       self.num_attention_heads, from_seq_length,
+                                       self.size_per_head)
 
-  # Take the dot product between "query" and "key" to get the raw
-  # attention scores.
-  # `attention_scores` = [B, N, F, T]
-  attention_scores = tf.matmul(query_layer, key_layer, transpose_b=True)
-  attention_scores = tf.multiply(attention_scores,
-                                 1.0 / math.sqrt(float(size_per_head)))
+    # `key_layer` = [B, N, T, H]
+    key_layer = transpose_for_scores(key_layer, batch_size, self.num_attention_heads,
+                                     to_seq_length, self.size_per_head)
 
-  if attention_mask is not None:
-    # `attention_mask` = [B, 1, F, T]
-    attention_mask = tf.expand_dims(attention_mask, axis=[1])
+    # Take the dot product between "query" and "key" to get the raw
+    # attention scores.
+    # `attention_scores` = [B, N, F, T]
+    attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+    attention_scores = attention_scores * 1.0 / math.sqrt(float(self.size_per_head))
 
-    # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
-    # masked positions, this operation will create a tensor which is 0.0 for
-    # positions we want to attend and -10000.0 for masked positions.
-    adder = (1.0 - tf.cast(attention_mask, tf.float32)) * -10000.0
+    if attention_mask is not None:
+      # `attention_mask` = [B, 1, F, T]
+      attention_mask = attention_mask.unsqueeze(1)
 
-    # Since we are adding it to the raw scores before the softmax, this is
-    # effectively the same as removing these entirely.
-    attention_scores += adder
+      # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
+      # masked positions, this operation will create a tensor which is 0.0 for
+      # positions we want to attend and -10000.0 for masked positions.
+      adder = (1.0 - attention_mask.float()) * -10000.0
 
-  # Normalize the attention scores to probabilities.
-  # `attention_probs` = [B, N, F, T]
-  attention_probs = tf.nn.softmax(attention_scores)
+      # Since we are adding it to the raw scores before the softmax, this is
+      # effectively the same as removing these entirely.
+      attention_scores += adder
 
-  # This is actually dropping out entire tokens to attend to, which might
-  # seem a bit unusual, but is taken from the original Transformer paper.
-  attention_probs = dropout(attention_probs, attention_probs_dropout_prob)
+    # Normalize the attention scores to probabilities.
+    # `attention_probs` = [B, N, F, T]
+    attention_probs = F.softmax(attention_scores, dim=-1)
 
-  # `value_layer` = [B, T, N, H]
-  value_layer = tf.reshape(
-      value_layer,
-      [batch_size, to_seq_length, num_attention_heads, size_per_head])
+    # This is actually dropping out entire tokens to attend to, which might
+    # seem a bit unusual, but is taken from the original Transformer paper.
+    attention_probs = F.dropout(attention_probs, self.attention_probs_dropout_prob, self.training)
 
-  # `value_layer` = [B, N, T, H]
-  value_layer = tf.transpose(value_layer, [0, 2, 1, 3])
+    # `value_layer` = [B, T, N, H]
+    value_layer = torch.reshape(
+        value_layer,
+        [batch_size, to_seq_length, self.num_attention_heads, self.size_per_head])
 
-  # `context_layer` = [B, N, F, H]
-  context_layer = tf.matmul(attention_probs, value_layer)
+    # `value_layer` = [B, N, T, H]
+    value_layer = value_layer.permute(0, 2, 1, 3)
 
-  # `context_layer` = [B, F, N, H]
-  context_layer = tf.transpose(context_layer, [0, 2, 1, 3])
+    # `context_layer` = [B, N, F, H]
+    context_layer = torch.matmul(attention_probs, value_layer)
 
-  if do_return_2d_tensor:
-    # `context_layer` = [B*F, N*V]
-    context_layer = tf.reshape(
-        context_layer,
-        [batch_size * from_seq_length, num_attention_heads * size_per_head])
-  else:
-    # `context_layer` = [B, F, N*V]
-    context_layer = tf.reshape(
-        context_layer,
-        [batch_size, from_seq_length, num_attention_heads * size_per_head])
+    # `context_layer` = [B, F, N, H]
+    context_layer = context_layer.permute(0, 2, 1, 3)
 
-  return context_layer
+    if self.do_return_2d_tensor:
+      # `context_layer` = [B*F, N*V]
+      context_layer = torch.reshape(
+          context_layer,
+          [batch_size * from_seq_length, self.num_attention_heads * self.size_per_head])
+    else:
+      # `context_layer` = [B, F, N*V]
+      context_layer = torch.reshape(
+          context_layer,
+          [batch_size, from_seq_length, self.num_attention_heads * self.size_per_head])
+
+    return context_layer
 
 
-def transformer_model(input_tensor,
-                      attention_mask=None,
+class transformer_model(nn.Module):
+  def __init__(self,
                       hidden_size=768,
                       num_hidden_layers=12,
                       num_attention_heads=12,
@@ -770,141 +811,152 @@ def transformer_model(input_tensor,
                       attention_probs_dropout_prob=0.1,
                       initializer_range=0.02,
                       do_return_all_layers=False):
-  """Multi-headed, multi-layer Transformer from "Attention is All You Need".
+    """Multi-headed, multi-layer Transformer from "Attention is All You Need".
 
-  This is almost an exact implementation of the original Transformer encoder.
+    This is almost an exact implementation of the original Transformer encoder.
 
-  See the original paper:
-  https://arxiv.org/abs/1706.03762
+    See the original paper:
+    https://arxiv.org/abs/1706.03762
 
-  Also see:
-  https://github.com/tensorflow/tensor2tensor/blob/master/tensor2tensor/models/transformer.py
+    Also see:
+    https://github.com/tensorflow/tensor2tensor/blob/master/tensor2tensor/models/transformer.py
 
-  Args:
-    input_tensor: float Tensor of shape [batch_size, seq_length, hidden_size].
-    attention_mask: (optional) int32 Tensor of shape [batch_size, seq_length,
-      seq_length], with 1 for positions that can be attended to and 0 in
-      positions that should not be.
-    hidden_size: int. Hidden size of the Transformer.
-    num_hidden_layers: int. Number of layers (blocks) in the Transformer.
-    num_attention_heads: int. Number of attention heads in the Transformer.
-    intermediate_size: int. The size of the "intermediate" (a.k.a., feed
-      forward) layer.
-    intermediate_act_fn: function. The non-linear activation function to apply
-      to the output of the intermediate/feed-forward layer.
-    hidden_dropout_prob: float. Dropout probability for the hidden layers.
-    attention_probs_dropout_prob: float. Dropout probability of the attention
-      probabilities.
-    initializer_range: float. Range of the initializer (stddev of truncated
-      normal).
-    do_return_all_layers: Whether to also return all layers or just the final
-      layer.
+    Args:
+      input_tensor: float Tensor of shape [batch_size, seq_length, hidden_size].
+      attention_mask: (optional) int32 Tensor of shape [batch_size, seq_length,
+        seq_length], with 1 for positions that can be attended to and 0 in
+        positions that should not be.
+      hidden_size: int. Hidden size of the Transformer.
+      num_hidden_layers: int. Number of layers (blocks) in the Transformer.
+      num_attention_heads: int. Number of attention heads in the Transformer.
+      intermediate_size: int. The size of the "intermediate" (a.k.a., feed
+        forward) layer.
+      intermediate_act_fn: function. The non-linear activation function to apply
+        to the output of the intermediate/feed-forward layer.
+      hidden_dropout_prob: float. Dropout probability for the hidden layers.
+      attention_probs_dropout_prob: float. Dropout probability of the attention
+        probabilities.
+      initializer_range: float. Range of the initializer (stddev of truncated
+        normal).
+      do_return_all_layers: Whether to also return all layers or just the final
+        layer.
 
-  Returns:
-    float Tensor of shape [batch_size, seq_length, hidden_size], the final
-    hidden layer of the Transformer.
+    Returns:
+      float Tensor of shape [batch_size, seq_length, hidden_size], the final
+      hidden layer of the Transformer.
 
-  Raises:
-    ValueError: A Tensor shape or parameter is invalid.
-  """
-  if hidden_size % num_attention_heads != 0:
-    raise ValueError(
-        "The hidden size (%d) is not a multiple of the number of attention "
-        "heads (%d)" % (hidden_size, num_attention_heads))
+    Raises:
+      ValueError: A Tensor shape or parameter is invalid.
+    """
+    super(transformer_model, self).__init__()
+    if hidden_size % num_attention_heads != 0:
+      raise ValueError(
+          "The hidden size (%d) is not a multiple of the number of attention "
+          "heads (%d)" % (hidden_size, num_attention_heads))
+    attention_head_size = int(hidden_size / num_attention_heads)
+    self.hidden_size = hidden_size
+    self.num_hidden_layers = num_hidden_layers
+    self.do_return_all_layers = do_return_all_layers
 
-  attention_head_size = int(hidden_size / num_attention_heads)
-  input_shape = get_shape_list(input_tensor, expected_rank=3)
-  batch_size = input_shape[0]
-  seq_length = input_shape[1]
-  input_width = input_shape[2]
+    self.layers = nn.ModuleList()
+    for layer_idx in range(num_hidden_layers):
+      self.layers.append(nn.ModuleDict())
+      self.layers[-1]['attention'] = nn.ModuleDict()
+      self.layers[-1]['attention']['self'] = attention_layer(
+                hidden_size,
+                num_attention_heads=num_attention_heads,
+                size_per_head=attention_head_size,
+                attention_probs_dropout_prob=attention_probs_dropout_prob,
+                initializer_range=initializer_range,
+                do_return_2d_tensor=True)
+      self.layers[-1]['attention']['output'] = nn.Linear(num_attention_heads * attention_head_size, hidden_size)
+      truncated_normal_(self.layers[-1]['attention']['output'].weight, std=initializer_range)
+      self.layers[-1]['attention']['output_dropout'] = nn.Dropout(hidden_dropout_prob)
+      self.layers[-1]['attention']['output_layer_norm'] = nn.LayerNorm(hidden_size)
 
-  # The Transformer performs sum residuals on all layers so the input needs
-  # to be the same as the hidden size.
-  if input_width != hidden_size:
-    raise ValueError("The width of the input tensor (%d) != hidden size (%d)" %
-                     (input_width, hidden_size))
+      self.layers[-1]['intermediate'] = nn.Linear(hidden_size, intermediate_size)
+      truncated_normal_(self.layers[-1]['intermediate'].weight, std=initializer_range)
+      self.layers[-1].intermediate_act = intermediate_act_fn or (lambda x: x)
 
-  # We keep the representation as a 2D tensor to avoid re-shaping it back and
-  # forth from a 3D tensor to a 2D tensor. Re-shapes are normally free on
-  # the GPU/CPU but may not be free on the TPU, so we want to minimize them to
-  # help the optimizer.
-  prev_output = reshape_to_matrix(input_tensor)
+      self.layers[-1]['output'] = nn.Linear(intermediate_size, hidden_size)
+      truncated_normal_(self.layers[-1]['intermediate'].weight, std=initializer_range)
+      self.layers[-1]['output_dropout'] = nn.Dropout(hidden_dropout_prob)
+      self.layers[-1]['output_layer_norm'] = nn.LayerNorm(hidden_size)
 
-  all_layer_outputs = []
-  for layer_idx in range(num_hidden_layers):
-    with tf.variable_scope("layer_%d" % layer_idx):
+  def forward(self, input_tensor, attention_mask=None):
+    input_shape = get_shape_list(input_tensor, expected_rank=3)
+    batch_size = input_shape[0]
+    seq_length = input_shape[1]
+    input_width = input_shape[2]
+
+    # The Transformer performs sum residuals on all layers so the input needs
+    # to be the same as the hidden size.
+    if input_width != self.hidden_size:
+      raise ValueError("The width of the input tensor (%d) != hidden size (%d)" %
+                       (input_width, self.hidden_size))
+
+    # We keep the representation as a 2D tensor to avoid re-shaping it back and
+    # forth from a 3D tensor to a 2D tensor. Re-shapes are normally free on
+    # the GPU/CPU but may not be free on the TPU, so we want to minimize them to
+    # help the optimizer.
+    prev_output = reshape_to_matrix(input_tensor)
+
+    all_layer_outputs = []
+    for layer_idx in range(self.num_hidden_layers):
       layer_input = prev_output
 
-      with tf.variable_scope("attention"):
-        attention_heads = []
-        with tf.variable_scope("self"):
-          attention_head = attention_layer(
-              from_tensor=layer_input,
-              to_tensor=layer_input,
-              attention_mask=attention_mask,
-              num_attention_heads=num_attention_heads,
-              size_per_head=attention_head_size,
-              attention_probs_dropout_prob=attention_probs_dropout_prob,
-              initializer_range=initializer_range,
-              do_return_2d_tensor=True,
-              batch_size=batch_size,
-              from_seq_length=seq_length,
-              to_seq_length=seq_length)
-          attention_heads.append(attention_head)
+      attention_heads = []
+      attention_head = self.layers[layer_idx]['attention']['self'](
+                from_tensor=layer_input,
+                to_tensor=layer_input,
+                attention_mask=attention_mask,
+                batch_size=batch_size,
+                from_seq_length=seq_length,
+                to_seq_length=seq_length)
+      attention_heads.append(attention_head)
 
-        attention_output = None
-        if len(attention_heads) == 1:
-          attention_output = attention_heads[0]
-        else:
-          # In the case where we have other sequences, we just concatenate
-          # them to the self-attention head before the projection.
-          attention_output = tf.concat(attention_heads, axis=-1)
+      attention_output = None
+      if len(attention_heads) == 1:
+        attention_output = attention_heads[0]
+      else:
+        # In the case where we have other sequences, we just concatenate
+        # them to the self-attention head before the projection.
+        attention_output = torch.cat(attention_heads, -1)
 
-        # Run a linear projection of `hidden_size` then add a residual
-        # with `layer_input`.
-        with tf.variable_scope("output"):
-          attention_output = tf.layers.dense(
-              attention_output,
-              hidden_size,
-              kernel_initializer=create_initializer(initializer_range))
-          attention_output = dropout(attention_output, hidden_dropout_prob)
-          attention_output = layer_norm(attention_output + layer_input)
+      # Run a linear projection of `hidden_size` then add a residual
+      # with `layer_input`.
+      attention_output = self.layers[layer_idx]['attention']['output'](
+            attention_output)
+      attention_output = self.layers[layer_idx]['attention']['output_dropout'](attention_output)
+      attention_output = self.layers[layer_idx]['attention']['output_layer_norm'](attention_output + layer_input)
 
       # The activation is only applied to the "intermediate" hidden layer.
-      with tf.variable_scope("intermediate"):
-        intermediate_output = tf.layers.dense(
-            attention_output,
-            intermediate_size,
-            activation=intermediate_act_fn,
-            kernel_initializer=create_initializer(initializer_range))
+      intermediate_output = self.layers[layer_idx]['intermediate'](attention_output)
+      intermediate_output = self.layers[layer_idx].intermediate_act(intermediate_output)
 
       # Down-project back to `hidden_size` then add the residual.
-      with tf.variable_scope("output"):
-        layer_output = tf.layers.dense(
-            intermediate_output,
-            hidden_size,
-            kernel_initializer=create_initializer(initializer_range))
-        layer_output = dropout(layer_output, hidden_dropout_prob)
-        layer_output = layer_norm(layer_output + attention_output)
-        prev_output = layer_output
-        all_layer_outputs.append(layer_output)
+      layer_output = self.layers[layer_idx]['output'](intermediate_output)
+      layer_output = self.layers[layer_idx]['output_dropout'](layer_output)
+      layer_output = self.layers[layer_idx]['output_layer_norm'](layer_output + attention_output)
+      prev_output = layer_output
+      all_layer_outputs.append(layer_output)
 
-  if do_return_all_layers:
-    final_outputs = []
-    for layer_output in all_layer_outputs:
-      final_output = reshape_from_matrix(layer_output, input_shape)
-      final_outputs.append(final_output)
-    return final_outputs
-  else:
-    final_output = reshape_from_matrix(prev_output, input_shape)
-    return final_output
+    if self.do_return_all_layers:
+      final_outputs = []
+      for layer_output in all_layer_outputs:
+        final_output = reshape_from_matrix(layer_output, input_shape)
+        final_outputs.append(final_output)
+      return final_outputs
+    else:
+      final_output = reshape_from_matrix(prev_output, input_shape)
+      return final_output
 
 
 def get_shape_list(tensor, expected_rank=None, name=None):
   """Returns a list of the shape of tensor, preferring static dimensions.
 
   Args:
-    tensor: A tf.Tensor object to find the shape of.
+    tensor: A torch.Tensor object to find the shape of.
     expected_rank: (optional) int. The expected rank of `tensor`. If this is
       specified and the `tensor` has a different rank, and exception will be
       thrown.
@@ -915,31 +967,33 @@ def get_shape_list(tensor, expected_rank=None, name=None):
     be returned as python integers, and dynamic dimensions will be returned
     as tf.Tensor scalars.
   """
-  if name is None:
-    name = tensor.name
+  # if name is None:
+  #   name = tensor.name
 
   if expected_rank is not None:
     assert_rank(tensor, expected_rank, name)
 
-  shape = tensor.shape.as_list()
+  shape = tensor.shape
 
-  non_static_indexes = []
-  for (index, dim) in enumerate(shape):
-    if dim is None:
-      non_static_indexes.append(index)
-
-  if not non_static_indexes:
-    return shape
-
-  dyn_shape = tf.shape(tensor)
-  for index in non_static_indexes:
-    shape[index] = dyn_shape[index]
   return shape
+
+  # non_static_indexes = []
+  # for (index, dim) in enumerate(shape):
+  #   if dim is None:
+  #     non_static_indexes.append(index)
+
+  # if not non_static_indexes:
+  #   return shape
+
+  # dyn_shape = tf.shape(tensor)
+  # for index in non_static_indexes:
+  #   shape[index] = dyn_shape[index]
+  # return shape
 
 
 def reshape_to_matrix(input_tensor):
   """Reshapes a >= rank 2 tensor to a rank 2 tensor (i.e., a matrix)."""
-  ndims = input_tensor.shape.ndims
+  ndims = len(input_tensor.shape)
   if ndims < 2:
     raise ValueError("Input tensor must have at least rank 2. Shape = %s" %
                      (input_tensor.shape))
@@ -947,7 +1001,7 @@ def reshape_to_matrix(input_tensor):
     return input_tensor
 
   width = input_tensor.shape[-1]
-  output_tensor = tf.reshape(input_tensor, [-1, width])
+  output_tensor = torch.reshape(input_tensor, [-1, width])
   return output_tensor
 
 
@@ -961,7 +1015,7 @@ def reshape_from_matrix(output_tensor, orig_shape_list):
   orig_dims = orig_shape_list[0:-1]
   width = output_shape[-1]
 
-  return tf.reshape(output_tensor, orig_dims + [width])
+  return torch.reshape(output_tensor, orig_dims + (width,))
 
 
 def assert_rank(tensor, expected_rank, name=None):
@@ -975,8 +1029,8 @@ def assert_rank(tensor, expected_rank, name=None):
   Raises:
     ValueError: If the expected shape doesn't match the actual shape.
   """
-  if name is None:
-    name = tensor.name
+  # if name is None:
+  #   name = tensor.name
 
   expected_rank_dict = {}
   if isinstance(expected_rank, six.integer_types):
@@ -985,10 +1039,9 @@ def assert_rank(tensor, expected_rank, name=None):
     for x in expected_rank:
       expected_rank_dict[x] = True
 
-  actual_rank = tensor.shape.ndims
+  actual_rank = len(tensor.shape)
   if actual_rank not in expected_rank_dict:
-    scope_name = tf.get_variable_scope().name
     raise ValueError(
         "For the tensor `%s` in scope `%s`, the actual rank "
         "`%d` (shape = %s) is not equal to the expected rank `%s`" %
-        (name, scope_name, actual_rank, str(tensor.shape), str(expected_rank)))
+        (name, 'none', actual_rank, str(tensor.shape), str(expected_rank)))
