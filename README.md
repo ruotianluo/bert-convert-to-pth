@@ -1,3 +1,26 @@
+# BERT (Convert to pytorch)
+
+Pixel-wise copy bert model in pytorch.
+
+To convert pretrained model:
+
+```
+python convert.py --folder uncased_L-12_H-768_A-12
+```
+
+The converted pth file will be in the same folder.
+
+From preliminary test in `convert.py`, the result will differ at the third decimal  relatively.
+
+-------
+
+Current problem:
+
+- forward function is not returnning anything, you have to access the features from the member variables.
+- No one-hot embedding is supported (The original code says it's sometime faster to use one-hot)
+- no training supported, and not planning.
+- Probably will add a new feature extraction code. Will see.
+
 # BERT
 
 ## Introduction
