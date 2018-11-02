@@ -131,14 +131,11 @@ class BertModel(nn.Module):
   ```
   """
 
-  def __init__(self, config):
+  def __init__(self, config, use_one_hot_embeddings=False):
     """Constructor for BertModel.
 
     Args:
       config: `BertConfig` instance.
-      input_ids: int32 Tensor of shape [batch_size, seq_length].
-      input_mask: (optional) int32 Tensor of shape [batch_size, seq_length].
-      token_type_ids: (optional) int32 Tensor of shape [batch_size, seq_length].
       use_one_hot_embeddings: (optional) bool. Whether to use one-hot word
         embeddings or tf.embedding_lookup() for the word embeddings. On the TPU,
         it is must faster if this is True, on the CPU or GPU, it is faster if
@@ -155,14 +152,13 @@ class BertModel(nn.Module):
     self.bert['embeddings'] = embedding_lookup(
             vocab_size=config.vocab_size,
             embedding_size=config.hidden_size,
-            initializer_range=config.initializer_range)
+            initializer_range=config.initializer_range,
+            use_one_hot_embeddings=use_one_hot_embeddings)
     self.bert['embedding_postprocessor'] = embedding_postprocessor(
             embedding_size=config.hidden_size,
             use_token_type=True,
             token_type_vocab_size=config.type_vocab_size,
-            token_type_embedding_name="token_type_embeddings",
             use_position_embeddings=True,
-            position_embedding_name="position_embeddings",
             initializer_range=config.initializer_range,
             max_position_embeddings=config.max_position_embeddings,
             dropout_prob=config.hidden_dropout_prob)
@@ -182,18 +178,13 @@ class BertModel(nn.Module):
   def forward(self,
               input_ids,
               input_mask=None,
-              token_type_ids=None,
-              use_one_hot_embeddings=False):
+              token_type_ids=None):
     """Forward for BertModel.
 
     Args:
       input_ids: int32 Tensor of shape [batch_size, seq_length].
       input_mask: (optional) int32 Tensor of shape [batch_size, seq_length].
       token_type_ids: (optional) int32 Tensor of shape [batch_size, seq_length].
-      use_one_hot_embeddings: (optional) bool. Whether to use one-hot word
-        embeddings or tf.embedding_lookup() for the word embeddings. On the TPU,
-        it is must faster if this is True, on the CPU or GPU, it is faster if
-        this is False.
 
     Raises:
       ValueError: The config is invalid or one of the input tensor shapes
@@ -246,6 +237,8 @@ class BertModel(nn.Module):
     # to the first token. We assume that this has been pre-trained
     first_token_tensor = torch.squeeze(self.sequence_output[:, 0:1, :], 1)
     self.pooled_output = torch.tanh(self.bert['pooler'](first_token_tensor))
+
+    return self.pooled_output
 
   def get_pooled_output(self):
     return self.pooled_output
@@ -374,7 +367,8 @@ class embedding_lookup(nn.Module):
   def __init__(self, 
                vocab_size,
                embedding_size=128,
-               initializer_range=0.02):
+               initializer_range=0.02,
+               use_one_hot_embeddings=False):
     """Looks up words embeddings for id tensor.
 
     Args:
@@ -389,16 +383,14 @@ class embedding_lookup(nn.Module):
     super(embedding_lookup, self).__init__()
     self.word_embeddings = nn.Embedding(vocab_size, embedding_size)
     truncated_normal_(self.word_embeddings.weight, std=initializer_range)
+    self.use_one_hot_embeddings = use_one_hot_embeddings
 
-  def forward(self, input_ids, use_one_hot_embeddings=False):
+  def forward(self, input_ids):
     """Looks up words embeddings for id tensor.
 
     Args:
       input_ids: int32 Tensor of shape [batch_size, seq_length] containing word
         ids.
-      use_one_hot_embeddings: bool. If True, use one-hot method for word
-        embeddings. If False, use `tf.nn.embedding_lookup()`. One hot is better
-        for TPUs.
 
     Returns:
       float Tensor of shape [batch_size, seq_length, embedding_size].
@@ -411,7 +403,7 @@ class embedding_lookup(nn.Module):
     if len(input_ids.shape) == 2:
       input_ids = input_ids.unsqueeze(-1)
 
-    if use_one_hot_embeddings:
+    if self.use_one_hot_embeddings:
       # flat_input_ids = tf.reshape(input_ids, [-1])
       # one_hot_input_ids = tf.one_hot(flat_input_ids, depth=vocab_size)
       # output = tf.matmul(one_hot_input_ids, embedding_table)
@@ -430,9 +422,7 @@ class embedding_postprocessor(nn.Module):
                embedding_size,
                use_token_type=False,
                token_type_vocab_size=16,
-               token_type_embedding_name="token_type_embeddings",
                use_position_embeddings=True,
-               position_embedding_name="position_embeddings",
                initializer_range=0.02,
                max_position_embeddings=512,
                dropout_prob=0.1):
@@ -441,12 +431,8 @@ class embedding_postprocessor(nn.Module):
     Args:
       use_token_type: bool. Whether to add embeddings for `token_type_ids`.
       token_type_vocab_size: int. The vocabulary size of `token_type_ids`.
-      token_type_embedding_name: string. The name of the embedding table variable
-        for token type ids.
       use_position_embeddings: bool. Whether to add position embeddings for the
         position of each token in the sequence.
-      position_embedding_name: string. The name of the embedding table variable
-        for positional embeddings.
       initializer_range: float. Range of the weight initialization.
       max_position_embeddings: int. Maximum sequence length that might ever be
         used with this model. This can be longer than the sequence length of
@@ -605,8 +591,7 @@ class attention_layer(nn.Module):
                key_act=None,
                value_act=None,
                attention_probs_dropout_prob=0.0,
-               initializer_range=0.02,
-               do_return_2d_tensor=False):
+               initializer_range=0.02):
     """Performs multi-headed attention from `from_tensor` to `to_tensor`.
 
     This is an implementation of multi-headed attention based on "Attention
@@ -642,22 +627,6 @@ class attention_layer(nn.Module):
       value_act: (optional) Activation function for the value transform.
       attention_probs_dropout_prob:
       initializer_range: float. Range of the weight initializer.
-      do_return_2d_tensor: bool. If True, the output will be of shape [batch_size
-        * from_seq_length, num_attention_heads * size_per_head]. If False, the
-        output will be of shape [batch_size, from_seq_length, num_attention_heads
-        * size_per_head].
-      batch_size: (Optional) int. If the input is 2D, this might be the batch size
-        of the 3D version of the `from_tensor` and `to_tensor`.
-      from_seq_length: (Optional) If the input is 2D, this might be the seq length
-        of the 3D version of the `from_tensor`.
-      to_seq_length: (Optional) If the input is 2D, this might be the seq length
-        of the 3D version of the `to_tensor`.
-
-    Returns:
-      float Tensor of shape [batch_size, from_seq_length,
-        num_attention_heads * size_per_head]. (If `do_return_2d_tensor` is
-        true, this will be of shape [batch_size * from_seq_length,
-        num_attention_heads * size_per_head]).
 
     Raises:
       ValueError: Any of the arguments or tensor shapes are invalid.
@@ -679,15 +648,28 @@ class attention_layer(nn.Module):
     self.value_act = value_act or (lambda x: x)
 
     self.attention_probs_dropout_prob = attention_probs_dropout_prob
-    self.do_return_2d_tensor = do_return_2d_tensor
 
   def forward(self,
               from_tensor,
               to_tensor,
-              attention_mask=None,
-              batch_size=None,
-              from_seq_length=None,
-              to_seq_length=None):
+              attention_mask=None):
+    """
+    Args:
+      from_tensor: float Tensor of shape [batch_size, from_seq_length,
+        from_width].
+      to_tensor: float Tensor of shape [batch_size, to_seq_length, to_width].
+      attention_mask: (optional) int32 Tensor of shape [batch_size,
+        from_seq_length, to_seq_length]. The values should be 1 or 0. The
+        attention scores will effectively be set to -infinity for any positions in
+        the mask that are 0, and will be unchanged for positions that are 1.
+
+    Returns:
+      float Tensor of shape [batch_size, from_seq_length,
+        num_attention_heads * size_per_head].
+
+    Raises:
+      ValueError: Any of the arguments or tensor shapes are invalid.
+    """
     def transpose_for_scores(input_tensor, batch_size, num_attention_heads,
                              seq_length, width):
       output_tensor = torch.reshape(
@@ -721,19 +703,16 @@ class attention_layer(nn.Module):
     #   N = `num_attention_heads`
     #   H = `size_per_head`
 
-    from_tensor_2d = reshape_to_matrix(from_tensor)
-    to_tensor_2d = reshape_to_matrix(to_tensor)
-
     # `query_layer` = [B*F, N*H]
-    query_layer = self.query(from_tensor_2d)
+    query_layer = self.query(from_tensor)
     query_layer = self.query_act(query_layer)
 
     # `key_layer` = [B*T, N*H]
-    key_layer = self.key(to_tensor_2d)
+    key_layer = self.key(to_tensor)
     key_layer = self.key_act(key_layer)
 
     # `value_layer` = [B*T, N*H]
-    value_layer = self.value(to_tensor_2d)
+    value_layer = self.value(to_tensor)
     value_layer = self.value_act(value_layer)
 
     # `query_layer` = [B, N, F, H]
@@ -786,16 +765,10 @@ class attention_layer(nn.Module):
     # `context_layer` = [B, F, N, H]
     context_layer = context_layer.permute(0, 2, 1, 3)
 
-    if self.do_return_2d_tensor:
-      # `context_layer` = [B*F, N*V]
-      context_layer = torch.reshape(
-          context_layer,
-          [batch_size * from_seq_length, self.num_attention_heads * self.size_per_head])
-    else:
-      # `context_layer` = [B, F, N*V]
-      context_layer = torch.reshape(
-          context_layer,
-          [batch_size, from_seq_length, self.num_attention_heads * self.size_per_head])
+    # `context_layer` = [B, F, N*V]
+    context_layer = torch.reshape(
+        context_layer,
+        [batch_size, from_seq_length, self.num_attention_heads * self.size_per_head])
 
     return context_layer
 
@@ -867,8 +840,7 @@ class transformer_model(nn.Module):
                 num_attention_heads=num_attention_heads,
                 size_per_head=attention_head_size,
                 attention_probs_dropout_prob=attention_probs_dropout_prob,
-                initializer_range=initializer_range,
-                do_return_2d_tensor=True)
+                initializer_range=initializer_range)
       self.layers[-1]['attention']['output'] = nn.Linear(num_attention_heads * attention_head_size, hidden_size)
       truncated_normal_(self.layers[-1]['attention']['output'].weight, std=initializer_range)
       self.layers[-1]['attention']['output_dropout'] = nn.Dropout(hidden_dropout_prob)
@@ -895,11 +867,7 @@ class transformer_model(nn.Module):
       raise ValueError("The width of the input tensor (%d) != hidden size (%d)" %
                        (input_width, self.hidden_size))
 
-    # We keep the representation as a 2D tensor to avoid re-shaping it back and
-    # forth from a 3D tensor to a 2D tensor. Re-shapes are normally free on
-    # the GPU/CPU but may not be free on the TPU, so we want to minimize them to
-    # help the optimizer.
-    prev_output = reshape_to_matrix(input_tensor)
+    prev_output = input_tensor
 
     all_layer_outputs = []
     for layer_idx in range(self.num_hidden_layers):
@@ -909,10 +877,7 @@ class transformer_model(nn.Module):
       attention_head = self.layers[layer_idx]['attention']['self'](
                 from_tensor=layer_input,
                 to_tensor=layer_input,
-                attention_mask=attention_mask,
-                batch_size=batch_size,
-                from_seq_length=seq_length,
-                to_seq_length=seq_length)
+                attention_mask=attention_mask)
       attention_heads.append(attention_head)
 
       attention_output = None
@@ -944,11 +909,11 @@ class transformer_model(nn.Module):
     if self.do_return_all_layers:
       final_outputs = []
       for layer_output in all_layer_outputs:
-        final_output = reshape_from_matrix(layer_output, input_shape)
+        final_output = layer_output
         final_outputs.append(final_output)
       return final_outputs
     else:
-      final_output = reshape_from_matrix(prev_output, input_shape)
+      final_output = prev_output
       return final_output
 
 
@@ -989,33 +954,6 @@ def get_shape_list(tensor, expected_rank=None, name=None):
   # for index in non_static_indexes:
   #   shape[index] = dyn_shape[index]
   # return shape
-
-
-def reshape_to_matrix(input_tensor):
-  """Reshapes a >= rank 2 tensor to a rank 2 tensor (i.e., a matrix)."""
-  ndims = len(input_tensor.shape)
-  if ndims < 2:
-    raise ValueError("Input tensor must have at least rank 2. Shape = %s" %
-                     (input_tensor.shape))
-  if ndims == 2:
-    return input_tensor
-
-  width = input_tensor.shape[-1]
-  output_tensor = torch.reshape(input_tensor, [-1, width])
-  return output_tensor
-
-
-def reshape_from_matrix(output_tensor, orig_shape_list):
-  """Reshapes a rank 2 tensor back to its original rank >= 2 tensor."""
-  if len(orig_shape_list) == 2:
-    return output_tensor
-
-  output_shape = get_shape_list(output_tensor)
-
-  orig_dims = orig_shape_list[0:-1]
-  width = output_shape[-1]
-
-  return torch.reshape(output_tensor, orig_dims + (width,))
 
 
 def assert_rank(tensor, expected_rank, name=None):
